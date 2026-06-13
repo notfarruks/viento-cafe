@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+twilio
+gspread
+oauth2client
+redis
