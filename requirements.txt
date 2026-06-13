@@ -2,6 +2,7 @@ fastapi
 uvicorn
 twilio
 gspread
-oauth2client
 redis
 python-multipart
+google-auth
+google-auth-httplib2

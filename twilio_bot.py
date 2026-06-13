@@ -3,12 +3,11 @@ from twilio.twiml.messaging_response import MessagingResponse
 from datetime import datetime
 from collections import Counter
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 import uuid
 import redis
 import json
 import os
-import tempfile
 
 app = FastAPI(title="Viento Cafe Pro - Premium Automated Waiter")
 
@@ -30,12 +29,9 @@ def save_session(phone: str, session: dict):
 
 # Google Sheets auth from environment variable
 def get_google_client():
-    creds_json = os.environ.get("GOOGLE_CREDS")
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        f.write(creds_json)
-        tmp_path = f.name
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(tmp_path, scope)
+    creds_json = json.loads(os.environ.get("GOOGLE_CREDS"))
+    scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
     return gspread.authorize(creds)
 
 # 💵 Centralized Price Database (AZN)
