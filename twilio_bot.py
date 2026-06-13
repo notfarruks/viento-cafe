@@ -5,11 +5,38 @@ from collections import Counter
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import random
+import redis
+import json
+import os
+import tempfile
 
 app = FastAPI(title="Viento Cafe Pro - Premium Automated Waiter")
 
-# In-memory session store
-user_sessions = {}
+# Redis session store
+redis_client = redis.from_url(
+    os.environ.get("REDIS_URL", "redis://localhost:6379"),
+    decode_responses=True
+)
+SESSION_TTL = 60 * 60 * 6  # 6 hours
+
+def get_session(phone: str) -> dict:
+    data = redis_client.get(f"session:{phone}")
+    if data:
+        return json.loads(data)
+    return {"lang": "az", "state": "IDLE", "basket": [], "table": "0 (Takeaway)"}
+
+def save_session(phone: str, session: dict):
+    redis_client.setex(f"session:{phone}", SESSION_TTL, json.dumps(session))
+
+# Google Sheets auth from environment variable
+def get_google_client():
+    creds_json = os.environ.get("GOOGLE_CREDS")
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        f.write(creds_json)
+        tmp_path = f.name
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name(tmp_path, scope)
+    return gspread.authorize(creds)
 
 # 💵 Centralized Price Database (AZN)
 PRICES = {
@@ -22,9 +49,7 @@ PRICES = {
 # 📊 Google Sheets Connection
 def write_to_google_sheets(phone, name, item_or_request, table_num, lang, order_id):
     try:
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("creds.json", scope)
-        client = gspread.authorize(creds)
+        client = get_google_client()
         sheet = client.open("Cafe_Orders_DB").sheet1
         
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -36,9 +61,7 @@ def write_to_google_sheets(phone, name, item_or_request, table_num, lang, order_
 # 🔍 Read Order Status live from the spreadsheet
 def fetch_order_status_from_sheets(phone):
     try:
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("creds.json", scope)
-        client = gspread.authorize(creds)
+        client = get_google_client()
         sheet = client.open("Cafe_Orders_DB").sheet1
         
         all_records = sheet.get_all_records()
@@ -103,16 +126,7 @@ LEXICON = {
 async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
     user_text = Body.lower().strip()
     response = MessagingResponse()
-    
-    if From not in user_sessions:
-        user_sessions[From] = {
-            "lang": "az", 
-            "state": "IDLE", 
-            "basket": [],  
-            "table": "0 (Takeaway)"
-        }
-        
-    session = user_sessions[From]
+    session = get_session(From)
 
     # 📍 PARSE TABLE ASSIGNMENT
     if "table" in user_text or "masa" in user_text or "стол" in user_text:
@@ -121,6 +135,7 @@ async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
             session["table"] = table_digits
             msg = LEXICON[session["lang"]]["welcome"].format(table=session["table"])
             response.message(msg)
+            save_session(From, session)
             return Response(content=str(response), media_type="application/xml")
 
     # 🌍 GLOBAL LANGUAGE SWITCHES
@@ -128,6 +143,7 @@ async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
         session["lang"] = user_text
         msg = LEXICON[user_text]["welcome"].format(table=session["table"])
         response.message(msg)
+        save_session(From, session)
         return Response(content=str(response), media_type="application/xml")
 
     lang = session["lang"]
@@ -137,6 +153,7 @@ async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
     if user_text in ["waiter", "ofisiant", "официант"]:
         write_to_google_sheets(From, "Valued Customer", "🚨 NEEDS PHYSICAL WAITER", table, lang.upper(), "N/A")
         response.message(LEXICON[lang]["waiter_alerted"])
+        save_session(From, session)
         return Response(content=str(response), media_type="application/xml")
 
     # 🔍 GLOBAL OVERRIDE: TRACK ORDER STATUS
@@ -146,6 +163,7 @@ async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
             response.message(LEXICON[lang]["status_success"].format(order_id=result["order_id"], status=result["status"]))
         else:
             response.message(LEXICON[lang]["status_not_found"])
+        save_session(From, session)
         return Response(content=str(response), media_type="application/xml")
 
     # 🗑️ BASKET MANAGEMENT: CLEAR CART
@@ -153,29 +171,25 @@ async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
         session["basket"] = []
         session["state"] = "IDLE"
         response.message(LEXICON[lang]["empty_basket"])
+        save_session(From, session)
         return Response(content=str(response), media_type="application/xml")
 
-    # 🛒 BASKET MANAGEMENT: CHECKOUT (With Live Math Processing)
+    # 🛒 BASKET MANAGEMENT: CHECKOUT
     if user_text in ["tesdiq", "təsdiq", "checkout", "подтвердить"]:
         if not session["basket"]:
             response.message(LEXICON[lang]["empty_basket"])
         else:
             session["state"] = "WAITING_FOR_NAME"
             item_counts = Counter(session["basket"])
-            
-            # Build detailed string breakdown showing: • 2x Item Name (15.00 AZN)
             summary_lines = []
             grand_total = 0.0
-            
             for item, qty in item_counts.items():
                 item_cost = PRICES.get(item, 0.0) * qty
                 grand_total += item_cost
                 summary_lines.append(f"• {qty}x {item} ({item_cost:.2f} AZN)")
-                
             basket_summary = "\n".join(summary_lines)
-            
-            # Send checkout text injecting both the visual summary and computed grand total
             response.message(LEXICON[lang]["ask_name"].format(basket_details=basket_summary, total_price=grand_total))
+        save_session(From, session)
         return Response(content=str(response), media_type="application/xml")
 
     # 🔄 STATE CHECK: WAITING FOR BASKET ADDITIONS
@@ -188,43 +202,35 @@ async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
         else:
             if user_text not in ["menu", "menyu", "меню"]:
                 response.message(LEXICON[lang]["fallback"])
+        save_session(From, session)
         return Response(content=str(response), media_type="application/xml")
 
-    # 📝 STATE CHECK: WAITING FOR CUSTOMER NAME & CLOSING ORDER RECEIPT
+    # 📝 STATE CHECK: WAITING FOR CUSTOMER NAME
     elif session["state"] == "WAITING_FOR_NAME":
         customer_name = Body.strip()
         generated_id = random.randint(100, 999)
-        
         item_counts = Counter(session["basket"])
-        
-        # Recalculate bill for the confirmation block receipt
         summary_lines = []
         grand_total = 0.0
         db_items = []
-        
         for item, qty in item_counts.items():
             item_cost = PRICES.get(item, 0.0) * qty
             grand_total += item_cost
             summary_lines.append(f"• {qty}x {item} ({item_cost:.2f} AZN)")
             db_items.append(f"{qty}x {item}")
-            
         final_order_string = ", ".join(db_items)
         basket_summary = "\n".join(summary_lines)
-        
-        # Commit transactional string row data to spreadsheet logs
         write_to_google_sheets(From, customer_name, final_order_string, table, lang.upper(), generated_id)
-        
-        # Reset memory structures entirely for future transaction loops
         session["basket"] = []
         session["state"] = "IDLE"
-        
         response.message(LEXICON[lang]["confirmed"].format(
-            name=customer_name, 
-            basket_details=basket_summary, 
-            total_price=grand_total, 
-            order_id=generated_id, 
+            name=customer_name,
+            basket_details=basket_summary,
+            total_price=grand_total,
+            order_id=generated_id,
             table=table
         ))
+        save_session(From, session)
         return Response(content=str(response), media_type="application/xml")
 
     # 🏁 CORE IDLE ROUTING
@@ -234,4 +240,5 @@ async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
     else:
         response.message(LEXICON[lang]["welcome"].format(table=table))
 
+    save_session(From, session)
     return Response(content=str(response), media_type="application/xml")
