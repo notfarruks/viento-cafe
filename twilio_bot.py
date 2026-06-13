@@ -1,20 +1,23 @@
 from fastapi import FastAPI, Form, Response
 from twilio.twiml.messaging_response import MessagingResponse
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from collections import Counter
 import gspread
+import gspread.exceptions
 from google.oauth2.service_account import Credentials
-import uuid
+from google.auth.exceptions import TransportError
+import random
 import redis
 import json
-import asyncio
 import os
+import uuid
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI(title="Viento Cafe Pro - Premium Automated Waiter")
 executor = ThreadPoolExecutor(max_workers=4)
 
-# Redis session store
+# ─── Redis Session Store ───────────────────────────────────────────────────────
 redis_client = redis.from_url(
     os.environ.get("REDIS_URL", "redis://localhost:6379"),
     decode_responses=True
@@ -30,20 +33,22 @@ def get_session(phone: str) -> dict:
 def save_session(phone: str, session: dict):
     redis_client.setex(f"session:{phone}", SESSION_TTL, json.dumps(session))
 
-# Cached at module level — created once on startup
+# ─── Google Sheets Auth (with auto token refresh) ─────────────────────────────
 _sheets_client = None
 
-def get_google_client():
+def get_google_client(force_refresh: bool = False):
     global _sheets_client
-    if _sheets_client is not None:
-        return _sheets_client
-    creds_json = json.loads(os.environ.get("GOOGLE_CREDS"))
-    scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
-    _sheets_client = gspread.authorize(creds)
+    if _sheets_client is None or force_refresh:
+        creds_json = json.loads(os.environ.get("GOOGLE_CREDS"))
+        scopes = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
+        _sheets_client = gspread.authorize(creds)
     return _sheets_client
 
-# 💵 Centralized Price Database (AZN)
+# ─── Price Database (AZN) ─────────────────────────────────────────────────────
 PRICES = {
     "Flat White": 6.00,
     "Iced Spanish Latte": 7.50,
@@ -51,30 +56,37 @@ PRICES = {
     "Croissant": 5.00
 }
 
-# 📊 Google Sheets Connection
+# ─── Google Sheets: Write Order ───────────────────────────────────────────────
 def write_to_google_sheets(phone, name, item_or_request, table_num, lang, order_id):
-    try:
-        client = get_google_client()
+    def _attempt(client):
         sheet = client.open("Cafe_Orders_DB").sheet1
-        
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         sheet.append_row([phone, name, item_or_request, table_num, lang, current_time, order_id, "Preparing"])
         print(f"📊 [GSHEET SUCCESS] Order #{order_id} logged cleanly.")
+
+    try:
+        _attempt(get_google_client())
+    except gspread.exceptions.APIError as e:
+        if e.response.status_code == 401:
+            print("🔄 [AUTH] Token expired, refreshing client...")
+            try:
+                _attempt(get_google_client(force_refresh=True))
+                print(f"📊 [GSHEET SUCCESS] Order #{order_id} logged after token refresh.")
+            except Exception as retry_error:
+                print(f"❌ [GSHEET FATAL] Retry failed: {retry_error}")
+        else:
+            print(f"⚠️ [GSHEET ERROR] Cloud sync skipped: {e}")
     except Exception as e:
         print(f"⚠️ [GSHEET ERROR] Cloud sync skipped: {e}")
 
-# 🔍 Read Order Status live from the spreadsheet
+# ─── Google Sheets: Fetch Order Status ───────────────────────────────────────
 def fetch_order_status_from_sheets(phone):
-    try:
-        client = get_google_client()
+    def _attempt(client):
         sheet = client.open("Cafe_Orders_DB").sheet1
-        
         all_records = sheet.get_all_records()
-        
         for record in reversed(all_records):
             db_phone = str(record.get("Phone Number", "")).replace("whatsapp:", "").strip()
             user_phone = str(phone).replace("whatsapp:", "").strip()
-            
             if db_phone == user_phone and db_phone != "":
                 return {
                     "found": True,
@@ -82,12 +94,25 @@ def fetch_order_status_from_sheets(phone):
                     "status": record.get("Status")
                 }
         return {"found": False}
+
+    try:
+        return _attempt(get_google_client())
+    except gspread.exceptions.APIError as e:
+        if e.response.status_code == 401:
+            print("🔄 [AUTH] Token expired, refreshing client...")
+            try:
+                return _attempt(get_google_client(force_refresh=True))
+            except Exception as retry_error:
+                print(f"❌ [STATUS FATAL] Retry failed: {retry_error}")
+                return {"found": False}
+        else:
+            print(f"⚠️ [STATUS FETCH ERROR]: {e}")
+            return {"found": False}
     except Exception as e:
         print(f"⚠️ [STATUS FETCH ERROR]: {e}")
         return {"found": False}
 
-
-# 🌍 Multilingual Lexicon Upgraded with Receipt & Pricing Layouts
+# ─── Multilingual Lexicon ─────────────────────────────────────────────────────
 LEXICON = {
     "az": {
         "welcome": "👋 *Viento Cafe*-a xoş gəlmisiniz!\n📍 Masanız: *Masa {table}*\n\n👉 Menyuya baxmaq və sifariş üçün: *MENYU*\n👉 Ofisiantı çağırmaq: *OFİSİANT*\n👉 Sifariş statusu: *STATUS*",
@@ -127,13 +152,14 @@ LEXICON = {
     }
 }
 
+# ─── Main Webhook Endpoint ────────────────────────────────────────────────────
 @app.post("/whatsapp")
 async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
     user_text = Body.lower().strip()
     response = MessagingResponse()
     session = get_session(From)
 
-    # 📍 PARSE TABLE ASSIGNMENT
+    # 📍 TABLE ASSIGNMENT
     if "table" in user_text or "masa" in user_text or "стол" in user_text:
         table_digits = "".join([char for char in user_text if char.isdigit()])
         if table_digits:
@@ -143,7 +169,7 @@ async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
             save_session(From, session)
             return Response(content=str(response), media_type="application/xml")
 
-    # 🌍 GLOBAL LANGUAGE SWITCHES
+    # 🌍 LANGUAGE SWITCH
     if user_text in ["az", "ru", "en"]:
         session["lang"] = user_text
         msg = LEXICON[user_text]["welcome"].format(table=session["table"])
@@ -154,24 +180,31 @@ async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
     lang = session["lang"]
     table = session["table"]
 
-    # 🚨 IMMEDIATE OVERRIDE: CALL THE WAITER
+    # 🚨 CALL WAITER
     if user_text in ["waiter", "ofisiant", "официант"]:
-        asyncio.get_event_loop().run_in_executor(executor, write_to_google_sheets, From, "Valued Customer", "🚨 NEEDS PHYSICAL WAITER", table, lang.upper(), "N/A")
+        asyncio.get_event_loop().run_in_executor(
+            executor, write_to_google_sheets,
+            From, "Valued Customer", "🚨 NEEDS PHYSICAL WAITER", table, lang.upper(), "N/A"
+        )
         response.message(LEXICON[lang]["waiter_alerted"])
         save_session(From, session)
         return Response(content=str(response), media_type="application/xml")
 
-    # 🔍 GLOBAL OVERRIDE: TRACK ORDER STATUS
+    # 🔍 ORDER STATUS
     if user_text in ["status", "состояние", "vəziyyət"]:
-        result = await asyncio.get_event_loop().run_in_executor(executor, fetch_order_status_from_sheets, From)
+        result = await asyncio.get_event_loop().run_in_executor(
+            executor, fetch_order_status_from_sheets, From
+        )
         if result["found"]:
-            response.message(LEXICON[lang]["status_success"].format(order_id=result["order_id"], status=result["status"]))
+            response.message(LEXICON[lang]["status_success"].format(
+                order_id=result["order_id"], status=result["status"]
+            ))
         else:
             response.message(LEXICON[lang]["status_not_found"])
         save_session(From, session)
         return Response(content=str(response), media_type="application/xml")
 
-    # 🗑️ BASKET MANAGEMENT: CLEAR CART
+    # 🗑️ CLEAR BASKET
     if user_text in ["sil", "clear", "очистить"]:
         session["basket"] = []
         session["state"] = "IDLE"
@@ -179,7 +212,7 @@ async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
         save_session(From, session)
         return Response(content=str(response), media_type="application/xml")
 
-    # 🛒 BASKET MANAGEMENT: CHECKOUT
+    # 🛒 CHECKOUT
     if user_text in ["tesdiq", "təsdiq", "checkout", "подтвердить"]:
         if not session["basket"]:
             response.message(LEXICON[lang]["empty_basket"])
@@ -193,13 +226,20 @@ async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
                 grand_total += item_cost
                 summary_lines.append(f"• {qty}x {item} ({item_cost:.2f} AZN)")
             basket_summary = "\n".join(summary_lines)
-            response.message(LEXICON[lang]["ask_name"].format(basket_details=basket_summary, total_price=grand_total))
+            response.message(LEXICON[lang]["ask_name"].format(
+                basket_details=basket_summary, total_price=grand_total
+            ))
         save_session(From, session)
         return Response(content=str(response), media_type="application/xml")
 
-    # 🔄 STATE CHECK: WAITING FOR BASKET ADDITIONS
+    # 🔄 WAITING FOR ITEM SELECTION
     if session["state"] == "WAITING_FOR_ITEM":
-        items_map = {"1": "Flat White", "2": "Iced Spanish Latte", "3": "San Sebastian Paxlava", "4": "Croissant"}
+        items_map = {
+            "1": "Flat White",
+            "2": "Iced Spanish Latte",
+            "3": "San Sebastian Paxlava",
+            "4": "Croissant"
+        }
         if user_text in items_map:
             chosen_item = items_map[user_text]
             session["basket"].append(chosen_item)
@@ -210,7 +250,7 @@ async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
         save_session(From, session)
         return Response(content=str(response), media_type="application/xml")
 
-    # 📝 STATE CHECK: WAITING FOR CUSTOMER NAME
+    # 📝 WAITING FOR CUSTOMER NAME
     elif session["state"] == "WAITING_FOR_NAME":
         customer_name = Body.strip()
         generated_id = str(uuid.uuid4())[:8].upper()
@@ -225,7 +265,10 @@ async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
             db_items.append(f"{qty}x {item}")
         final_order_string = ", ".join(db_items)
         basket_summary = "\n".join(summary_lines)
-        asyncio.get_event_loop().run_in_executor(executor, write_to_google_sheets, From, customer_name, final_order_string, table, lang.upper(), generated_id)
+        asyncio.get_event_loop().run_in_executor(
+            executor, write_to_google_sheets,
+            From, customer_name, final_order_string, table, lang.upper(), generated_id
+        )
         session["basket"] = []
         session["state"] = "IDLE"
         response.message(LEXICON[lang]["confirmed"].format(
@@ -238,7 +281,7 @@ async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
         save_session(From, session)
         return Response(content=str(response), media_type="application/xml")
 
-    # 🏁 CORE IDLE ROUTING
+    # 🏁 IDLE ROUTING
     if user_text in ["menu", "menyu", "меню"]:
         response.message(LEXICON[lang]["menu"].format(table=table))
         session["state"] = "WAITING_FOR_ITEM"
