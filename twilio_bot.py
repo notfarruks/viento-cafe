@@ -4,7 +4,7 @@ from datetime import datetime
 from collections import Counter
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import random
+import uuid
 import redis
 import json
 import os
@@ -208,7 +208,7 @@ async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
     # 📝 STATE CHECK: WAITING FOR CUSTOMER NAME
     elif session["state"] == "WAITING_FOR_NAME":
         customer_name = Body.strip()
-        generated_id = random.randint(100, 999)
+        generated_id = str(uuid.uuid4())[:8].upper()
         item_counts = Counter(session["basket"])
         summary_lines = []
         grand_total = 0.0
