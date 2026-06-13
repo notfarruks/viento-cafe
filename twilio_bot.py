@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Form, Response
 from twilio.twiml.messaging_response import MessagingResponse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from collections import Counter
 import gspread
@@ -7,9 +8,11 @@ from google.oauth2.service_account import Credentials
 import uuid
 import redis
 import json
+import asyncio
 import os
 
 app = FastAPI(title="Viento Cafe Pro - Premium Automated Waiter")
+executor = ThreadPoolExecutor(max_workers=4)
 
 # Redis session store
 redis_client = redis.from_url(
@@ -153,14 +156,14 @@ async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
 
     # 🚨 IMMEDIATE OVERRIDE: CALL THE WAITER
     if user_text in ["waiter", "ofisiant", "официант"]:
-        write_to_google_sheets(From, "Valued Customer", "🚨 NEEDS PHYSICAL WAITER", table, lang.upper(), "N/A")
+        asyncio.get_event_loop().run_in_executor(executor, write_to_google_sheets, From, "Valued Customer", "🚨 NEEDS PHYSICAL WAITER", table, lang.upper(), "N/A")
         response.message(LEXICON[lang]["waiter_alerted"])
         save_session(From, session)
         return Response(content=str(response), media_type="application/xml")
 
     # 🔍 GLOBAL OVERRIDE: TRACK ORDER STATUS
     if user_text in ["status", "состояние", "vəziyyət"]:
-        result = fetch_order_status_from_sheets(From)
+        result = await asyncio.get_event_loop().run_in_executor(executor, fetch_order_status_from_sheets, From)
         if result["found"]:
             response.message(LEXICON[lang]["status_success"].format(order_id=result["order_id"], status=result["status"]))
         else:
@@ -222,7 +225,7 @@ async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
             db_items.append(f"{qty}x {item}")
         final_order_string = ", ".join(db_items)
         basket_summary = "\n".join(summary_lines)
-        write_to_google_sheets(From, customer_name, final_order_string, table, lang.upper(), generated_id)
+        asyncio.get_event_loop().run_in_executor(executor, write_to_google_sheets, From, customer_name, final_order_string, table, lang.upper(), generated_id)
         session["basket"] = []
         session["state"] = "IDLE"
         response.message(LEXICON[lang]["confirmed"].format(
