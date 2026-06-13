@@ -27,12 +27,18 @@ def get_session(phone: str) -> dict:
 def save_session(phone: str, session: dict):
     redis_client.setex(f"session:{phone}", SESSION_TTL, json.dumps(session))
 
-# Google Sheets auth from environment variable
+# Cached at module level — created once on startup
+_sheets_client = None
+
 def get_google_client():
+    global _sheets_client
+    if _sheets_client is not None:
+        return _sheets_client
     creds_json = json.loads(os.environ.get("GOOGLE_CREDS"))
     scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
-    return gspread.authorize(creds)
+    _sheets_client = gspread.authorize(creds)
+    return _sheets_client
 
 # 💵 Centralized Price Database (AZN)
 PRICES = {
