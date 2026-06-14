@@ -508,19 +508,6 @@ async def admin_login(request: Request):
     return response
 
 
-@app.get("/debug-sheet")
-async def debug_sheet(request: Request):
-    api_key = request.headers.get("X-Admin-Key", "")
-    if api_key != os.environ.get("ADMIN_KEY", ""):
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    client = get_google_client()
-    sheet = client.open("Cafe_Orders_DB").sheet1
-    headers = sheet.row_values(1)
-    first_row = sheet.row_values(2)
-    return {"headers": headers, "first_row": first_row}
-
-
-
 @app.get("/admin/logout")
 async def admin_logout():
     response = RedirectResponse(url="/admin", status_code=302)
