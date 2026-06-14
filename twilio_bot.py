@@ -37,6 +37,17 @@ def get_session(phone: str) -> dict:
 def save_session(phone: str, session: dict):
     redis_client.setex(f"session:{phone}", SESSION_TTL, json.dumps(session))
 
+def is_rate_limited(phone: str) -> bool:
+    key = f"rate:{phone}"
+    count = redis_client.get(key)
+    if count and int(count) >= 10:
+        return True
+    pipe = redis_client.pipeline()
+    pipe.incr(key)
+    pipe.expire(key, 60)  # reset counter every 60 seconds
+    pipe.execute()
+    return False
+
 # ─── Twilio Signature Validation ──────────────────────────────────────────────
 async def validate_twilio_request(request: Request) -> dict:
     auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
@@ -226,6 +237,10 @@ async def incoming_whatsapp(request: Request):
     user_text = Body.lower().strip()
     response = MessagingResponse()
     session = get_session(From)
+
+    if is_rate_limited(From):
+        response.message("⚠️ Too many messages. Please wait a moment.")
+        return Response(content=str(response), media_type="application/xml")
 
     # 📍 TABLE ASSIGNMENT
     if "table" in user_text or "masa" in user_text or "стол" in user_text:
