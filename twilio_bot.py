@@ -1,3 +1,5 @@
+import logging
+import sys
 from fastapi import FastAPI, Form, Response, Request, HTTPException
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.request_validator import RequestValidator
@@ -6,6 +8,7 @@ from collections import Counter
 import gspread
 import gspread.exceptions
 from google.oauth2.service_account import Credentials
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 import redis
 import json
 import os
@@ -14,10 +17,23 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from lexicon import LEXICON
 
-app = FastAPI(title="Viento Cafe Pro - Premium Automated Waiter")
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
+# ─── Logging Setup ────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("viento")
 
+def log(level: str, msg: str, **context):
+    """Structured log with key=value context appended."""
+    ctx = " ".join(f"{k}={v}" for k, v in context.items())
+    full_msg = f"{msg} | {ctx}" if ctx else msg
+    getattr(logger, level)(full_msg)
+
+# ─── App Setup ────────────────────────────────────────────────────────────────
+app = FastAPI(title="Viento Cafe Pro - Premium Automated Waiter")
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
 executor = ThreadPoolExecutor(max_workers=4)
 
@@ -32,19 +48,22 @@ def get_session(phone: str) -> dict:
     data = redis_client.get(f"session:{phone}")
     if data:
         return json.loads(data)
+    log("info", "New session created", phone=phone[-6:])
     return {"lang": "az", "state": "IDLE", "basket": [], "table": "0 (Takeaway)"}
 
 def save_session(phone: str, session: dict):
     redis_client.setex(f"session:{phone}", SESSION_TTL, json.dumps(session))
 
+# ─── Rate Limiting ────────────────────────────────────────────────────────────
 def is_rate_limited(phone: str) -> bool:
     key = f"rate:{phone}"
     count = redis_client.get(key)
     if count and int(count) >= 10:
+        log("warning", "Rate limit hit", phone=phone[-6:])
         return True
     pipe = redis_client.pipeline()
     pipe.incr(key)
-    pipe.expire(key, 60)  # reset counter every 60 seconds
+    pipe.expire(key, 60)
     pipe.execute()
     return False
 
@@ -54,17 +73,13 @@ async def validate_twilio_request(request: Request) -> dict:
     validator = RequestValidator(auth_token)
     form_data = await request.form()
     params = dict(form_data)
-
-    # Reconstruct the exact URL Twilio signed
     forwarded_proto = request.headers.get("x-forwarded-proto", "https")
     forwarded_host = request.headers.get("x-forwarded-host", request.headers.get("host", ""))
     url = f"{forwarded_proto}://{forwarded_host}{request.url.path}"
-
     signature = request.headers.get("X-Twilio-Signature", "")
-
     if not validator.validate(url, params, signature):
+        log("warning", "Invalid Twilio signature rejected", url=url)
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
-
     return params
 
 # ─── Google Sheets Auth ───────────────────────────────────────────────────────
@@ -80,26 +95,19 @@ def get_google_client(force_refresh: bool = False):
         ]
         creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
         _sheets_client = gspread.authorize(creds)
+        log("info", "Google Sheets client initialized", force_refresh=force_refresh)
     return _sheets_client
 
-# ─── Dynamic Menu (loaded from Sheets on startup) ────────────────────────────
-# These are populated by load_menu() at startup and can be reloaded anytime
-PRICES = {}        # {"Flat White": 6.00, ...}
-ITEMS_MAP = {}     # {"1": "Flat White", ...}
-DISPLAY_NAMES = {  # {"az": {"1": "Flat White"}, "ru": {"1": "Флэт Уайт"}, ...}
-    "az": {},
-    "ru": {},
-    "en": {}
-}
+# ─── Dynamic Menu ─────────────────────────────────────────────────────────────
+PRICES = {}
+ITEMS_MAP = {}
+DISPLAY_NAMES = {"az": {}, "ru": {}, "en": {}}
 
 def load_menu():
-    """Load menu from Google Sheets and populate global dicts."""
     global PRICES, ITEMS_MAP, DISPLAY_NAMES
     try:
         client = get_google_client()
         spreadsheet = client.open("Cafe_Orders_DB")
-
-        # Load base menu (id, name, price)
         menu_sheet = spreadsheet.worksheet("Menu")
         menu_records = menu_sheet.get_all_records()
 
@@ -112,9 +120,7 @@ def load_menu():
             new_prices[name] = price
             new_items_map[item_id] = name
 
-        # Load localized display names
         new_display = {"az": {}, "ru": {}, "en": {}}
-
         for lang, sheet_name in [("az", "Menu_AZ"), ("ru", "Menu_RU")]:
             try:
                 lang_sheet = spreadsheet.worksheet(sheet_name)
@@ -122,21 +128,17 @@ def load_menu():
                 for row in lang_records:
                     new_display[lang][str(row["id"])] = row["display_name"]
             except Exception as e:
-                print(f"⚠️ [MENU] Could not load {sheet_name}: {e}")
+                log("warning", f"Could not load {sheet_name}", error=str(e))
 
-        # English uses base name as display name
         new_display["en"] = {k: v for k, v in new_items_map.items()}
-
         PRICES = new_prices
         ITEMS_MAP = new_items_map
         DISPLAY_NAMES = new_display
-
-        print(f"✅ [MENU] Loaded {len(PRICES)} items from Sheets.")
+        log("info", "Menu loaded successfully", items=len(PRICES))
     except Exception as e:
-        print(f"❌ [MENU] Failed to load menu: {e}")
+        log("error", "Failed to load menu", error=str(e))
 
 def build_menu_text(lang: str, table: str) -> str:
-    """Build the menu message string dynamically from loaded data."""
     headers = {
         "az": f"☕ *Masa {table} üçün Menyu* ☕\n\n",
         "ru": f"☕ *Меню для Столика {table}* ☕\n\n",
@@ -155,12 +157,11 @@ def build_menu_text(lang: str, table: str) -> str:
         price = PRICES.get(base_name, 0.0)
         emoji = number_emojis.get(item_id, f"{item_id}.")
         lines.append(f"{emoji} {display} - {price:.2f} AZN")
-
     return headers[lang] + "\n".join(lines) + footers[lang]
 
-# ─── Load menu on startup ─────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
+    log("info", "Viento Cafe bot starting up...")
     load_menu()
 
 # ─── Google Sheets: Write Order ───────────────────────────────────────────────
@@ -169,21 +170,22 @@ def write_to_google_sheets(phone, name, item_or_request, table_num, lang, order_
         sheet = client.open("Cafe_Orders_DB").sheet1
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         sheet.append_row([phone, name, item_or_request, table_num, lang, current_time, order_id, "Preparing"])
-        print(f"📊 [GSHEET SUCCESS] Order #{order_id} logged cleanly.")
 
     try:
         _attempt(get_google_client())
+        log("info", "Order written to Sheets", order=order_id, table=table_num, phone=phone[-6:])
     except gspread.exceptions.APIError as e:
         if e.response.status_code == 401:
-            print("🔄 [AUTH] Token expired, refreshing client...")
+            log("warning", "Token expired, refreshing", order=order_id)
             try:
                 _attempt(get_google_client(force_refresh=True))
+                log("info", "Order written after token refresh", order=order_id)
             except Exception as retry_error:
-                print(f"❌ [GSHEET FATAL] Retry failed: {retry_error}")
+                log("error", "Sheets write failed after retry", order=order_id, error=str(retry_error))
         else:
-            print(f"⚠️ [GSHEET ERROR] Cloud sync skipped: {e}")
+            log("error", "Sheets API error", order=order_id, status=e.response.status_code)
     except Exception as e:
-        print(f"⚠️ [GSHEET ERROR] Cloud sync skipped: {e}")
+        log("error", "Sheets write failed", order=order_id, error=str(e))
 
 # ─── Google Sheets: Fetch Order Status ───────────────────────────────────────
 def fetch_order_status_from_sheets(phone):
@@ -202,28 +204,30 @@ def fetch_order_status_from_sheets(phone):
         return {"found": False}
 
     try:
-        return _attempt(get_google_client())
+        result = _attempt(get_google_client())
+        log("info", "Status fetched", phone=phone[-6:], found=result["found"])
+        return result
     except gspread.exceptions.APIError as e:
         if e.response.status_code == 401:
-            print("🔄 [AUTH] Token expired, refreshing client...")
+            log("warning", "Token expired on status fetch, refreshing", phone=phone[-6:])
             try:
                 return _attempt(get_google_client(force_refresh=True))
             except Exception as retry_error:
-                print(f"❌ [STATUS FATAL] Retry failed: {retry_error}")
+                log("error", "Status fetch failed after retry", phone=phone[-6:], error=str(retry_error))
                 return {"found": False}
         else:
-            print(f"⚠️ [STATUS FETCH ERROR]: {e}")
+            log("error", "Sheets API error on status fetch", status=e.response.status_code)
             return {"found": False}
     except Exception as e:
-        print(f"⚠️ [STATUS FETCH ERROR]: {e}")
+        log("error", "Status fetch failed", phone=phone[-6:], error=str(e))
         return {"found": False}
 
-
-# ─── Reload menu endpoint (call this after updating the sheet) ────────────────
+# ─── Reload Menu Endpoint ─────────────────────────────────────────────────────
 @app.post("/reload-menu")
 async def reload_menu(request: Request):
     api_key = request.headers.get("X-Admin-Key", "")
     if api_key != os.environ.get("ADMIN_KEY", ""):
+        log("warning", "Unauthorized reload-menu attempt")
         raise HTTPException(status_code=403, detail="Unauthorized")
     load_menu()
     return {"status": "ok", "items": len(PRICES)}
@@ -242,11 +246,14 @@ async def incoming_whatsapp(request: Request):
         response.message("⚠️ Too many messages. Please wait a moment.")
         return Response(content=str(response), media_type="application/xml")
 
+    log("info", "Incoming message", phone=From[-6:], state=session["state"], text=user_text[:20])
+
     # 📍 TABLE ASSIGNMENT
     if "table" in user_text or "masa" in user_text or "стол" in user_text:
         table_digits = "".join([char for char in user_text if char.isdigit()])
         if table_digits:
             session["table"] = table_digits
+            log("info", "Table assigned", phone=From[-6:], table=table_digits)
             msg = LEXICON[session["lang"]]["welcome"].format(table=session["table"])
             response.message(msg)
             save_session(From, session)
@@ -255,6 +262,7 @@ async def incoming_whatsapp(request: Request):
     # 🌍 LANGUAGE SWITCH
     if user_text in ["az", "ru", "en"]:
         session["lang"] = user_text
+        log("info", "Language switched", phone=From[-6:], lang=user_text)
         msg = LEXICON[user_text]["welcome"].format(table=session["table"])
         response.message(msg)
         save_session(From, session)
@@ -265,6 +273,7 @@ async def incoming_whatsapp(request: Request):
 
     # 🚨 CALL WAITER
     if user_text in ["waiter", "ofisiant", "официант"]:
+        log("info", "Waiter requested", phone=From[-6:], table=table)
         asyncio.get_event_loop().run_in_executor(
             executor, write_to_google_sheets,
             From, "Valued Customer", "🚨 NEEDS PHYSICAL WAITER", table, lang.upper(), "N/A"
@@ -289,6 +298,7 @@ async def incoming_whatsapp(request: Request):
 
     # 🗑️ CLEAR BASKET
     if user_text in ["sil", "clear", "очистить"]:
+        log("info", "Basket cleared", phone=From[-6:])
         session["basket"] = []
         session["state"] = "IDLE"
         response.message(LEXICON[lang]["empty_basket"])
@@ -308,11 +318,11 @@ async def incoming_whatsapp(request: Request):
                 item_cost = PRICES.get(item, 0.0) * qty
                 grand_total += item_cost
                 display = next(
-                    (DISPLAY_NAMES[lang].get(k) for k, v in ITEMS_MAP.items() if v == item),
-                    item
+                    (DISPLAY_NAMES[lang].get(k) for k, v in ITEMS_MAP.items() if v == item), item
                 )
                 summary_lines.append(f"• {qty}x {display} ({item_cost:.2f} AZN)")
             basket_summary = "\n".join(summary_lines)
+            log("info", "Checkout initiated", phone=From[-6:], total=grand_total, items=len(item_counts))
             response.message(LEXICON[lang]["ask_name"].format(
                 basket_details=basket_summary, total_price=grand_total
             ))
@@ -325,6 +335,7 @@ async def incoming_whatsapp(request: Request):
             chosen_item = ITEMS_MAP[user_text]
             session["basket"].append(chosen_item)
             display = DISPLAY_NAMES[lang].get(user_text, chosen_item)
+            log("info", "Item added to basket", phone=From[-6:], item=chosen_item)
             response.message(LEXICON[lang]["added_item"].format(item=display))
         else:
             if user_text not in ["menu", "menyu", "меню"]:
@@ -344,13 +355,13 @@ async def incoming_whatsapp(request: Request):
             item_cost = PRICES.get(item, 0.0) * qty
             grand_total += item_cost
             display = next(
-                (DISPLAY_NAMES[lang].get(k) for k, v in ITEMS_MAP.items() if v == item),
-                item
+                (DISPLAY_NAMES[lang].get(k) for k, v in ITEMS_MAP.items() if v == item), item
             )
             summary_lines.append(f"• {qty}x {display} ({item_cost:.2f} AZN)")
             db_items.append(f"{qty}x {item}")
         final_order_string = ", ".join(db_items)
         basket_summary = "\n".join(summary_lines)
+        log("info", "Order confirmed", phone=From[-6:], order=generated_id, name=customer_name, total=grand_total, table=table)
         asyncio.get_event_loop().run_in_executor(
             executor, write_to_google_sheets,
             From, customer_name, final_order_string, table, lang.upper(), generated_id
