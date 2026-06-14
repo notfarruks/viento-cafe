@@ -21,7 +21,7 @@ redis_client = redis.from_url(
     os.environ.get("REDIS_URL", "redis://localhost:6379"),
     decode_responses=True
 )
-SESSION_TTL = 60 * 60 * 6  # 6 hours
+SESSION_TTL = 60 * 60 * 6
 
 def get_session(phone: str) -> dict:
     data = redis_client.get(f"session:{phone}")
@@ -36,18 +36,15 @@ def save_session(phone: str, session: dict):
 async def validate_twilio_request(request: Request) -> dict:
     auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
     validator = RequestValidator(auth_token)
-
     form_data = await request.form()
     params = dict(form_data)
     url = str(request.url)
     signature = request.headers.get("X-Twilio-Signature", "")
-
     if not validator.validate(url, params, signature):
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
-
     return params
 
-# ─── Google Sheets Auth (with auto token refresh) ─────────────────────────────
+# ─── Google Sheets Auth ───────────────────────────────────────────────────────
 _sheets_client = None
 
 def get_google_client(force_refresh: bool = False):
@@ -62,13 +59,86 @@ def get_google_client(force_refresh: bool = False):
         _sheets_client = gspread.authorize(creds)
     return _sheets_client
 
-# ─── Price Database (AZN) ─────────────────────────────────────────────────────
-PRICES = {
-    "Flat White": 6.00,
-    "Iced Spanish Latte": 7.50,
-    "San Sebastian Paxlava": 9.00,
-    "Croissant": 5.00
+# ─── Dynamic Menu (loaded from Sheets on startup) ────────────────────────────
+# These are populated by load_menu() at startup and can be reloaded anytime
+PRICES = {}        # {"Flat White": 6.00, ...}
+ITEMS_MAP = {}     # {"1": "Flat White", ...}
+DISPLAY_NAMES = {  # {"az": {"1": "Flat White"}, "ru": {"1": "Флэт Уайт"}, ...}
+    "az": {},
+    "ru": {},
+    "en": {}
 }
+
+def load_menu():
+    """Load menu from Google Sheets and populate global dicts."""
+    global PRICES, ITEMS_MAP, DISPLAY_NAMES
+    try:
+        client = get_google_client()
+        spreadsheet = client.open("Cafe_Orders_DB")
+
+        # Load base menu (id, name, price)
+        menu_sheet = spreadsheet.worksheet("Menu")
+        menu_records = menu_sheet.get_all_records()
+
+        new_prices = {}
+        new_items_map = {}
+        for row in menu_records:
+            item_id = str(row["id"])
+            name = row["name"]
+            price = float(row["price"])
+            new_prices[name] = price
+            new_items_map[item_id] = name
+
+        # Load localized display names
+        new_display = {"az": {}, "ru": {}, "en": {}}
+
+        for lang, sheet_name in [("az", "Menu_AZ"), ("ru", "Menu_RU")]:
+            try:
+                lang_sheet = spreadsheet.worksheet(sheet_name)
+                lang_records = lang_sheet.get_all_records()
+                for row in lang_records:
+                    new_display[lang][str(row["id"])] = row["display_name"]
+            except Exception as e:
+                print(f"⚠️ [MENU] Could not load {sheet_name}: {e}")
+
+        # English uses base name as display name
+        new_display["en"] = {k: v for k, v in new_items_map.items()}
+
+        PRICES = new_prices
+        ITEMS_MAP = new_items_map
+        DISPLAY_NAMES = new_display
+
+        print(f"✅ [MENU] Loaded {len(PRICES)} items from Sheets.")
+    except Exception as e:
+        print(f"❌ [MENU] Failed to load menu: {e}")
+
+def build_menu_text(lang: str, table: str) -> str:
+    """Build the menu message string dynamically from loaded data."""
+    headers = {
+        "az": f"☕ *Masa {table} üçün Menyu* ☕\n\n",
+        "ru": f"☕ *Меню для Столика {table}* ☕\n\n",
+        "en": f"☕ *Menu for Table {table}* ☕\n\n"
+    }
+    footers = {
+        "az": "\n\n👉 Sifariş etmək istədiyiniz məhsulun *nömrəsini* yazın!",
+        "ru": "\n\n👉 Введите *номер* товара для добавления в корзину!",
+        "en": "\n\n👉 Reply with the item *number* to add it to your cart!"
+    }
+    number_emojis = {"1": "1️⃣", "2": "2️⃣", "3": "3️⃣", "4": "4️⃣",
+                     "5": "5️⃣", "6": "6️⃣", "7": "7️⃣", "8": "8️⃣", "9": "9️⃣"}
+    lines = []
+    for item_id, base_name in ITEMS_MAP.items():
+        display = DISPLAY_NAMES[lang].get(item_id, base_name)
+        price = PRICES.get(base_name, 0.0)
+        emoji = number_emojis.get(item_id, f"{item_id}.")
+        lines.append(f"{emoji} {display} - {price:.2f} AZN")
+
+    return headers[lang] + "\n".join(lines) + footers[lang]
+
+# ─── Load menu on startup ─────────────────────────────────────────────────────
+@app.on_event("startup")
+async def startup_event():
+    load_menu()
 
 # ─── Google Sheets: Write Order ───────────────────────────────────────────────
 def write_to_google_sheets(phone, name, item_or_request, table_num, lang, order_id):
@@ -85,7 +155,6 @@ def write_to_google_sheets(phone, name, item_or_request, table_num, lang, order_
             print("🔄 [AUTH] Token expired, refreshing client...")
             try:
                 _attempt(get_google_client(force_refresh=True))
-                print(f"📊 [GSHEET SUCCESS] Order #{order_id} logged after token refresh.")
             except Exception as retry_error:
                 print(f"❌ [GSHEET FATAL] Retry failed: {retry_error}")
         else:
@@ -130,7 +199,6 @@ def fetch_order_status_from_sheets(phone):
 LEXICON = {
     "az": {
         "welcome": "👋 *Viento Cafe*-a xoş gəlmisiniz!\n📍 Masanız: *Masa {table}*\n\n👉 Menyuya baxmaq və sifariş üçün: *MENYU*\n👉 Ofisiantı çağırmaq: *OFİSİANT*\n👉 Sifariş statusu: *STATUS*",
-        "menu": "☕ *Masa {table} üçün Menyu* ☕\n\n1️⃣ Flat White - 6.00 AZN\n2️⃣ Iced Spanish Latte - 7.50 AZN\n3️⃣ San Sebastian Paxlava - 9.00 AZN\n4️⃣ Kruassan - 5.00 AZN\n\n👉 Sifariş etmək istədiyiniz məhsulun *nömrəsini* yazın!",
         "added_item": "➕ *{item}* səbətinizə əlavə olundu!\n\n👉 Başqa bir şey istəyirsinizsə, yeni məhsul *nömrəsini* yazın.\n👉 Sifarişi tamamlamaq üçün: *TƏSDİQ*\n👉 Səbəti təmizləmək üçün: *SİL*",
         "empty_basket": "Səbətiniz boşdur. Sifariş üçün əvvəlcə *MENYU* yazın.",
         "ask_name": "🛍️ *Səbətiniz:*\n{basket_details}\n\n💵 *Cəm məbləğ:* {total_price:.2f} AZN\n\nSifarişi mətbəxə göndərmək üçün **adınızı** qeyd edin:",
@@ -142,7 +210,6 @@ LEXICON = {
     },
     "ru": {
         "welcome": "👋 Добро пожаловать в *Viento Cafe*!\n📍 Ваш столик: *Стол {table}*\n\n👉 Меню и заказ: *МЕНЮ*\n👉 Вызвать официанта: *ОФИЦИАНТ*\n👉 Статус заказа: *СТАТУС*",
-        "menu": "☕ *Меню для Столика {table}* ☕\n\n1️⃣ Флэт Уайт - 6.00 AZN\n2️⃣ Айс Испанский Латте - 7.50 AZN\n3️⃣ Сан-Себастьян Пахлава - 9.00 AZN\n4️⃣ Круассан - 5.00 AZN\n\n👉 Введите *номер* товара для добавления в корзину!",
         "added_item": "➕ *{item}* добавлен в вашу корзину!\n\n👉 Чтобы добавить ещё что-то, введите другой *номер*.\n👉 Для оформления заказа напишите: *ПОДТВЕРДИТЬ*\n👉 Чтобы очистить корзину: *ОЧИСТИТЬ*",
         "empty_basket": "Ваша корзина пуста. Напишите *МЕНЮ*, чтобы выбрать товары.",
         "ask_name": "🛍️ *Ваша корзина:*\n{basket_details}\n\n💵 *Итого к оплате:* {total_price:.2f} AZN\n\nНа какое **имя** записать заказ для отправки на кухню?",
@@ -154,7 +221,6 @@ LEXICON = {
     },
     "en": {
         "welcome": "👋 Welcome to *Viento Cafe*!\n📍 Your location: *Table {table}*\n\n👉 View menu & order: *MENU*\n👉 Call a waiter: *WAITER*\n👉 Track order status: *STATUS*",
-        "menu": "☕ *Menu for Table {table}* ☕\n\n1️⃣ Flat White - 6.00 AZN\n2️⃣ Iced Spanish Latte - 7.50 AZN\n3️⃣ San Sebastian Baklava - 9.00 AZN\n4️⃣ Croissant - 5.00 AZN\n\n👉 Reply with the item *number* to add it to your cart!",
         "added_item": "➕ *{item}* added to your basket!\n\n👉 To add more, reply with another item *number*.\n👉 To complete your order, reply: *CHECKOUT*\n👉 To clear your basket, reply: *CLEAR*",
         "empty_basket": "Your basket is empty. Type *MENU* to browse items first.",
         "ask_name": "🛍️ *Your Basket:*\n{basket_details}\n\n💵 *Total Price:* {total_price:.2f} AZN\n\nPlease type your **name** to send this order to the kitchen:",
@@ -166,12 +232,19 @@ LEXICON = {
     }
 }
 
+# ─── Reload menu endpoint (call this after updating the sheet) ────────────────
+@app.post("/reload-menu")
+async def reload_menu(request: Request):
+    api_key = request.headers.get("X-Admin-Key", "")
+    if api_key != os.environ.get("ADMIN_KEY", ""):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    load_menu()
+    return {"status": "ok", "items": len(PRICES)}
+
 # ─── Main Webhook Endpoint ────────────────────────────────────────────────────
 @app.post("/whatsapp")
 async def incoming_whatsapp(request: Request):
-    # Validate the request is genuinely from Twilio
     params = await validate_twilio_request(request)
-
     Body = params.get("Body", "")
     From = params.get("From", "")
     user_text = Body.lower().strip()
@@ -243,7 +316,11 @@ async def incoming_whatsapp(request: Request):
             for item, qty in item_counts.items():
                 item_cost = PRICES.get(item, 0.0) * qty
                 grand_total += item_cost
-                summary_lines.append(f"• {qty}x {item} ({item_cost:.2f} AZN)")
+                display = next(
+                    (DISPLAY_NAMES[lang].get(k) for k, v in ITEMS_MAP.items() if v == item),
+                    item
+                )
+                summary_lines.append(f"• {qty}x {display} ({item_cost:.2f} AZN)")
             basket_summary = "\n".join(summary_lines)
             response.message(LEXICON[lang]["ask_name"].format(
                 basket_details=basket_summary, total_price=grand_total
@@ -253,16 +330,11 @@ async def incoming_whatsapp(request: Request):
 
     # 🔄 WAITING FOR ITEM SELECTION
     if session["state"] == "WAITING_FOR_ITEM":
-        items_map = {
-            "1": "Flat White",
-            "2": "Iced Spanish Latte",
-            "3": "San Sebastian Paxlava",
-            "4": "Croissant"
-        }
-        if user_text in items_map:
-            chosen_item = items_map[user_text]
+        if user_text in ITEMS_MAP:
+            chosen_item = ITEMS_MAP[user_text]
             session["basket"].append(chosen_item)
-            response.message(LEXICON[lang]["added_item"].format(item=chosen_item))
+            display = DISPLAY_NAMES[lang].get(user_text, chosen_item)
+            response.message(LEXICON[lang]["added_item"].format(item=display))
         else:
             if user_text not in ["menu", "menyu", "меню"]:
                 response.message(LEXICON[lang]["fallback"])
@@ -280,7 +352,11 @@ async def incoming_whatsapp(request: Request):
         for item, qty in item_counts.items():
             item_cost = PRICES.get(item, 0.0) * qty
             grand_total += item_cost
-            summary_lines.append(f"• {qty}x {item} ({item_cost:.2f} AZN)")
+            display = next(
+                (DISPLAY_NAMES[lang].get(k) for k, v in ITEMS_MAP.items() if v == item),
+                item
+            )
+            summary_lines.append(f"• {qty}x {display} ({item_cost:.2f} AZN)")
             db_items.append(f"{qty}x {item}")
         final_order_string = ", ".join(db_items)
         basket_summary = "\n".join(summary_lines)
@@ -302,7 +378,7 @@ async def incoming_whatsapp(request: Request):
 
     # 🏁 IDLE ROUTING
     if user_text in ["menu", "menyu", "меню"]:
-        response.message(LEXICON[lang]["menu"].format(table=table))
+        response.message(build_menu_text(lang, table))
         session["state"] = "WAITING_FOR_ITEM"
     else:
         response.message(LEXICON[lang]["welcome"].format(table=table))
