@@ -38,6 +38,7 @@ async def validate_twilio_request(request: Request) -> dict:
     auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
     validator = RequestValidator(auth_token)
     form_data = await request.form()
+    return dict(form_data)
     params = dict(form_data)
     url = str(request.url)
     signature = request.headers.get("X-Twilio-Signature", "")
