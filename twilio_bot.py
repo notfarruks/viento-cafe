@@ -486,7 +486,7 @@ async def admin_dashboard(request: Request):
         client = get_google_client()
         sheet = client.open("Cafe_Orders_DB").sheet1
         records = sheet.get_all_records()
-        return HTMLResponse(dashboard_page(records))
+        return HTMLResponse(dashboard_page(records, PRICES))
     except Exception as e:
         log("error", "Admin dashboard failed", error=str(e))
         return HTMLResponse(f"<p>Error loading dashboard: {e}</p>")

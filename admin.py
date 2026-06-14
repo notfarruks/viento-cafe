@@ -1,8 +1,7 @@
-from fastapi import Request, Response, HTTPException
+from fastapi import Request
 from fastapi.responses import HTMLResponse
 import os
 import hashlib
-import json
 
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 COOKIE_NAME = "viento_admin"
@@ -54,41 +53,43 @@ def login_page(error: bool = False) -> str:
 </body>
 </html>"""
 
-def dashboard_page(records: list) -> str:
+def dashboard_page(records: list, prices: dict) -> str:
     from datetime import datetime
 
     today = datetime.now().strftime("%Y-%m-%d")
     today_orders = [r for r in records if str(r.get("Timestamp", "")).startswith(today)]
 
-    total_revenue = 0.0
+    # Parse items and calculate revenue
     item_counts = {}
-    status_counts = {"Preparing": 0, "Cooking": 0, "Ready": 0}
+    total_revenue = 0.0
+    status_counts = {"Preparing": 0, "Cooking": 0, "Ready": 0, "Other": 0}
 
     for r in today_orders:
-        # Parse revenue from items string e.g. "2x Flat White, 1x Croissant"
         items_str = str(r.get("Items", ""))
-        for part in items_str.split(","):
-            part = part.strip()
-            if "x " in part:
-                try:
-                    qty, item = part.split("x ", 1)
-                    qty = int(qty.strip())
-                    item = item.strip()
-                    item_counts[item] = item_counts.get(item, 0) + qty
-                except:
-                    pass
+        if items_str and items_str != "🚨 NEEDS PHYSICAL WAITER":
+            for part in items_str.split(","):
+                part = part.strip()
+                if "x " in part:
+                    try:
+                        qty_str, item = part.split("x ", 1)
+                        qty = int(qty_str.strip())
+                        item = item.strip()
+                        item_counts[item] = item_counts.get(item, 0) + qty
+                        total_revenue += prices.get(item, 0.0) * qty
+                    except:
+                        pass
 
         status = str(r.get("Status", "Preparing"))
         if status in status_counts:
             status_counts[status] += 1
+        elif status:
+            status_counts["Other"] += 1
 
-    # Calculate revenue from Google Sheet prices column not available,
-    # so count orders instead
-    total_orders = len(today_orders)
-    all_time_orders = len(records)
+    total_orders = len([r for r in today_orders if str(r.get("Order ID", "")) not in ("N/A", "")])
+    all_time_orders = len([r for r in records if str(r.get("Order ID", "")) not in ("N/A", "")])
 
-    # Build orders table rows (last 20, newest first)
-    recent = list(reversed(records))[:20]
+    # Recent orders table (last 20, newest first, skip waiter alerts)
+    recent = [r for r in reversed(records) if str(r.get("Order ID", "")) not in ("N/A", "")][:20]
 
     def status_badge(s):
         colors = {
@@ -101,23 +102,45 @@ def dashboard_page(records: list) -> str:
 
     rows = ""
     for r in recent:
-        if str(r.get("Order ID", "")) == "N/A":
-            continue
+        items_str = str(r.get("Items", "—"))
+        table = str(r.get("Table", "—"))
+        timestamp = str(r.get("Timestamp", ""))
+        time_str = timestamp[11:16] if len(timestamp) > 11 else "—"
+
+        # Calculate order total
+        order_total = 0.0
+        for part in items_str.split(","):
+            part = part.strip()
+            if "x " in part:
+                try:
+                    qty_str, item = part.split("x ", 1)
+                    order_total += prices.get(item.strip(), 0.0) * int(qty_str.strip())
+                except:
+                    pass
+
+        total_str = f"{order_total:.2f} AZN" if order_total > 0 else "—"
+
         rows += f"""<tr>
-            <td>#{r.get('Order ID','')}</td>
-            <td>Table {r.get('Table','')}</td>
-            <td>{r.get('Name','')}</td>
-            <td style="color:#888;font-size:13px">{r.get('Items','')}</td>
+            <td style="font-weight:600">#{r.get('Order ID','')}</td>
+            <td>Table {table}</td>
+            <td>{r.get('Name','—')}</td>
+            <td style="color:#888;font-size:12px;max-width:200px">{items_str}</td>
+            <td style="font-weight:600;color:#f5f5f5">{total_str}</td>
             <td>{status_badge(str(r.get('Status','Preparing')))}</td>
-            <td style="color:#888;font-size:13px">{str(r.get('Timestamp',''))[11:16]}</td>
+            <td style="color:#888;font-size:13px">{time_str}</td>
         </tr>"""
 
-    top_items = sorted(item_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-    top_items_html = "".join(
-        f'<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #2a2a2a">'
-        f'<span>{item}</span><span style="color:#f59e0b;font-weight:600">{qty}x</span></div>'
-        for item, qty in top_items
-    ) or '<p style="color:#888;font-size:14px">No orders today</p>'
+    top_items_html = ""
+    if item_counts:
+        top_items = sorted(item_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_items_html = "".join(
+            f'<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #2a2a2a">'
+            f'<span style="font-size:14px">{item}</span>'
+            f'<span style="color:#f59e0b;font-weight:600;font-size:14px">{qty}x</span></div>'
+            for item, qty in top_items
+        )
+    else:
+        top_items_html = '<p style="color:#888;font-size:14px">No orders today</p>'
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -131,24 +154,26 @@ def dashboard_page(records: list) -> str:
           background: #0f0f0f; color: #f5f5f5; padding: 24px; }}
   h1 {{ font-size: 22px; font-weight: 700; margin-bottom: 4px; }}
   .sub {{ color: #888; font-size: 14px; margin-bottom: 28px; }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
            gap: 16px; margin-bottom: 28px; }}
   .stat {{ background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px; padding: 20px; }}
   .stat-label {{ font-size: 12px; color: #888; text-transform: uppercase;
                  letter-spacing: 0.05em; margin-bottom: 8px; }}
-  .stat-value {{ font-size: 32px; font-weight: 700; }}
+  .stat-value {{ font-size: 28px; font-weight: 700; }}
   .card {{ background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px;
-           padding: 20px; margin-bottom: 20px; }}
+           padding: 20px; margin-bottom: 20px; overflow-x: auto; }}
   .card h2 {{ font-size: 15px; font-weight: 600; margin-bottom: 16px; color: #ccc; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
-  th {{ text-align: left; color: #666; font-size: 12px; text-transform: uppercase;
+  th {{ text-align: left; color: #666; font-size: 11px; text-transform: uppercase;
         letter-spacing: 0.05em; padding-bottom: 10px; border-bottom: 1px solid #2a2a2a; }}
-  td {{ padding: 12px 0; border-bottom: 1px solid #1e1e1e; vertical-align: middle; }}
+  td {{ padding: 12px 8px 12px 0; border-bottom: 1px solid #1e1e1e; vertical-align: middle; }}
   tr:last-child td {{ border-bottom: none; }}
-  .logout {{ float: right; color: #888; font-size: 13px; text-decoration: none; }}
+  .logout {{ color: #888; font-size: 13px; text-decoration: none; }}
   .logout:hover {{ color: #f5f5f5; }}
   .refresh {{ display: inline-block; margin-left: 12px; color: #888; font-size: 13px;
-              text-decoration: none; cursor: pointer; }}
+              text-decoration: none; }}
+  .refresh:hover {{ color: #f5f5f5; }}
+  @media(max-width:600px) {{ body {{ padding: 16px; }} }}
 </style>
 </head>
 <body>
@@ -156,11 +181,15 @@ def dashboard_page(records: list) -> str:
   <h1>☕ Viento Cafe</h1>
   <a href="/admin/logout" class="logout">Sign out</a>
 </div>
-<p class="sub">Dashboard · Today: {today} 
+<p class="sub">Dashboard · Today: {today}
   <a href="/admin" class="refresh">↻ Refresh</a>
 </p>
 
 <div class="grid">
+  <div class="stat">
+    <div class="stat-label">Today's Revenue</div>
+    <div class="stat-value" style="color:#22c55e;font-size:22px">{total_revenue:.2f} AZN</div>
+  </div>
   <div class="stat">
     <div class="stat-label">Today's Orders</div>
     <div class="stat-value">{total_orders}</div>
@@ -175,11 +204,11 @@ def dashboard_page(records: list) -> str:
   </div>
   <div class="stat">
     <div class="stat-label">All Time Orders</div>
-    <div class="stat-value" style="font-size:24px">{all_time_orders}</div>
+    <div class="stat-value" style="font-size:22px">{all_time_orders}</div>
   </div>
 </div>
 
-<div style="display:grid;grid-template-columns:2fr 1fr;gap:20px">
+<div style="display:grid;grid-template-columns:2fr 1fr;gap:20px;flex-wrap:wrap">
   <div class="card">
     <h2>Recent Orders</h2>
     <table>
@@ -189,11 +218,12 @@ def dashboard_page(records: list) -> str:
           <th>Table</th>
           <th>Name</th>
           <th>Items</th>
+          <th>Total</th>
           <th>Status</th>
           <th>Time</th>
         </tr>
       </thead>
-      <tbody>{rows}</tbody>
+      <tbody>{rows if rows else '<tr><td colspan="7" style="color:#888;padding:20px 0">No orders yet</td></tr>'}</tbody>
     </table>
   </div>
   <div class="card">
