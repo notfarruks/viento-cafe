@@ -1,5 +1,6 @@
 import logging
 import sys
+import httpx
 from fastapi import FastAPI, Form, Response, Request, HTTPException
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.request_validator import RequestValidator
@@ -158,7 +159,6 @@ def build_menu_text(lang: str, table: str) -> str:
         lines.append(f"{emoji} {display} - {price:.2f} AZN")
     return headers[lang] + "\n".join(lines) + footers[lang]
 
-# ─── Language Picker Message ──────────────────────────────────────────────────
 def build_language_picker(table: str) -> str:
     return (
         f"👋 *Viento Cafe*-a xoş gəlmisiniz! / Welcome! / Добро пожаловать!\n"
@@ -169,10 +169,62 @@ def build_language_picker(table: str) -> str:
         f"🇷🇺 *RU* — Русский"
     )
 
+# ─── Telegram Kitchen Alerts ──────────────────────────────────────────────────
+async def send_telegram_alert(message: str):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        log("warning", "Telegram not configured, skipping alert")
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": message,
+                    "parse_mode": "HTML"
+                },
+                timeout=5.0
+            )
+            if resp.status_code == 200:
+                log("info", "Telegram alert sent")
+            else:
+                log("error", "Telegram alert failed", status=resp.status_code, body=resp.text[:100])
+    except Exception as e:
+        log("error", "Telegram alert exception", error=str(e))
+
+def build_kitchen_alert(order_id, table, customer_name, basket_summary, grand_total):
+    return (
+        f"🔔 <b>YENİ SİFARİŞ / NEW ORDER</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 <b>Order:</b> #{order_id}\n"
+        f"📍 <b>Table:</b> {table}\n"
+        f"👤 <b>Name:</b> {customer_name}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{basket_summary}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>Total:</b> {grand_total:.2f} AZN\n"
+        f"⏰ <b>Time:</b> {datetime.now().strftime('%H:%M')}"
+    )
+
+def build_waiter_alert(table):
+    return (
+        f"🚨 <b>WAITER NEEDED</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📍 <b>Table:</b> {table}\n"
+        f"⏰ <b>Time:</b> {datetime.now().strftime('%H:%M')}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"A customer is requesting a physical waiter."
+    )
+
 @app.on_event("startup")
 async def startup_event():
     log("info", "Viento Cafe bot starting up...")
-    load_menu()
+    try:
+        load_menu()
+    except Exception as e:
+        log("warning", "Menu load deferred, will retry on first request", error=str(e))
 
 # ─── Google Sheets: Write Order ───────────────────────────────────────────────
 def write_to_google_sheets(phone, name, item_or_request, table_num, lang, order_id):
@@ -251,6 +303,9 @@ async def incoming_whatsapp(request: Request):
     user_text = Body.lower().strip()
     response = MessagingResponse()
     session = get_session(From)
+    if not PRICES:
+        log("info", "Menu not loaded, loading now...")
+        load_menu()
 
     if is_rate_limited(From):
         response.message("⚠️ Too many messages. Please wait a moment.")
@@ -259,7 +314,6 @@ async def incoming_whatsapp(request: Request):
     log("info", "Incoming message", phone=From[-6:], state=session["state"], text=user_text[:20])
 
     # ─── STEP 1: TABLE ASSIGNMENT ─────────────────────────────────────────────
-    # Triggered by QR code scan which pre-fills "table5" etc.
     if "table" in user_text or "masa" in user_text or "стол" in user_text:
         table_digits = "".join([char for char in user_text if char.isdigit()])
         if table_digits:
@@ -282,13 +336,11 @@ async def incoming_whatsapp(request: Request):
             save_session(From, session)
             return Response(content=str(response), media_type="application/xml")
         else:
-            # Customer sent something else before picking a language
             table = session["table"] or "?"
             response.message(build_language_picker(table))
             save_session(From, session)
             return Response(content=str(response), media_type="application/xml")
 
-    # ─── FROM HERE: LANGUAGE AND TABLE ARE SET ────────────────────────────────
     lang = session["lang"]
     table = session["table"] or "Takeaway"
 
@@ -308,6 +360,7 @@ async def incoming_whatsapp(request: Request):
             executor, write_to_google_sheets,
             From, "Valued Customer", "🚨 NEEDS PHYSICAL WAITER", table, lang.upper(), "N/A"
         )
+        asyncio.create_task(send_telegram_alert(build_waiter_alert(table)))
         response.message(LEXICON[lang]["waiter_alerted"])
         save_session(From, session)
         return Response(content=str(response), media_type="application/xml")
@@ -391,11 +444,19 @@ async def incoming_whatsapp(request: Request):
             db_items.append(f"{qty}x {item}")
         final_order_string = ", ".join(db_items)
         basket_summary = "\n".join(summary_lines)
-        log("info", "Order confirmed", phone=From[-6:], order=generated_id, name=customer_name, total=grand_total, table=table)
+
+        log("info", "Order confirmed", phone=From[-6:], order=generated_id,
+            name=customer_name, total=grand_total, table=table)
+
+        # Write to Sheets and alert kitchen simultaneously
         asyncio.get_event_loop().run_in_executor(
             executor, write_to_google_sheets,
             From, customer_name, final_order_string, table, lang.upper(), generated_id
         )
+        asyncio.create_task(send_telegram_alert(
+            build_kitchen_alert(generated_id, table, customer_name, basket_summary, grand_total)
+        ))
+
         session["basket"] = []
         session["state"] = "IDLE"
         response.message(LEXICON[lang]["confirmed"].format(
