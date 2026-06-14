@@ -15,6 +15,10 @@ from concurrent.futures import ThreadPoolExecutor
 from lexicon import LEXICON
 
 app = FastAPI(title="Viento Cafe Pro - Premium Automated Waiter")
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
+
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
 executor = ThreadPoolExecutor(max_workers=4)
 
 # ─── Redis Session Store ───────────────────────────────────────────────────────
@@ -38,12 +42,18 @@ async def validate_twilio_request(request: Request) -> dict:
     auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
     validator = RequestValidator(auth_token)
     form_data = await request.form()
-    return dict(form_data)
     params = dict(form_data)
-    url = str(request.url)
+
+    # Reconstruct the exact URL Twilio signed
+    forwarded_proto = request.headers.get("x-forwarded-proto", "https")
+    forwarded_host = request.headers.get("x-forwarded-host", request.headers.get("host", ""))
+    url = f"{forwarded_proto}://{forwarded_host}{request.url.path}"
+
     signature = request.headers.get("X-Twilio-Signature", "")
+
     if not validator.validate(url, params, signature):
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
     return params
 
 # ─── Google Sheets Auth ───────────────────────────────────────────────────────
