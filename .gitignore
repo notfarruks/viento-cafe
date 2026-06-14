@@ -3,3 +3,4 @@ ngrok.exe
 __pycache__/
 *.pyc
 .env
+reload_menu.py

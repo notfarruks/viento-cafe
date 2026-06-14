@@ -1,12 +1,11 @@
-from fastapi import FastAPI, Form, Response
+from fastapi import FastAPI, Form, Response, Request, HTTPException
 from twilio.twiml.messaging_response import MessagingResponse
+from twilio.request_validator import RequestValidator
 from datetime import datetime
 from collections import Counter
 import gspread
 import gspread.exceptions
 from google.oauth2.service_account import Credentials
-from google.auth.exceptions import TransportError
-import random
 import redis
 import json
 import os
@@ -32,6 +31,21 @@ def get_session(phone: str) -> dict:
 
 def save_session(phone: str, session: dict):
     redis_client.setex(f"session:{phone}", SESSION_TTL, json.dumps(session))
+
+# ─── Twilio Signature Validation ──────────────────────────────────────────────
+async def validate_twilio_request(request: Request) -> dict:
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
+    validator = RequestValidator(auth_token)
+
+    form_data = await request.form()
+    params = dict(form_data)
+    url = str(request.url)
+    signature = request.headers.get("X-Twilio-Signature", "")
+
+    if not validator.validate(url, params, signature):
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    return params
 
 # ─── Google Sheets Auth (with auto token refresh) ─────────────────────────────
 _sheets_client = None
@@ -154,7 +168,12 @@ LEXICON = {
 
 # ─── Main Webhook Endpoint ────────────────────────────────────────────────────
 @app.post("/whatsapp")
-async def incoming_whatsapp(Body: str = Form(...), From: str = Form(...)):
+async def incoming_whatsapp(request: Request):
+    # Validate the request is genuinely from Twilio
+    params = await validate_twilio_request(request)
+
+    Body = params.get("Body", "")
+    From = params.get("From", "")
     user_text = Body.lower().strip()
     response = MessagingResponse()
     session = get_session(From)
