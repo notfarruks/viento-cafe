@@ -221,10 +221,7 @@ def build_waiter_alert(table):
 @app.on_event("startup")
 async def startup_event():
     log("info", "Viento Cafe bot starting up...")
-    try:
-        load_menu()
-    except Exception as e:
-        log("warning", "Menu load deferred, will retry on first request", error=str(e))
+    load_menu()
 
 # ─── Google Sheets: Write Order ───────────────────────────────────────────────
 def write_to_google_sheets(phone, name, item_or_request, table_num, lang, order_id):
@@ -303,9 +300,6 @@ async def incoming_whatsapp(request: Request):
     user_text = Body.lower().strip()
     response = MessagingResponse()
     session = get_session(From)
-    if not PRICES:
-        log("info", "Menu not loaded, loading now...")
-        load_menu()
 
     if is_rate_limited(From):
         response.message("⚠️ Too many messages. Please wait a moment.")
@@ -478,3 +472,43 @@ async def incoming_whatsapp(request: Request):
 
     save_session(From, session)
     return Response(content=str(response), media_type="application/xml")
+
+
+# ─── Admin Dashboard Routes ───────────────────────────────────────────────────
+from fastapi.responses import HTMLResponse, RedirectResponse
+from admin import is_authenticated, make_token, login_page, dashboard_page, COOKIE_NAME
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_dashboard(request: Request):
+    if not is_authenticated(request):
+        return HTMLResponse(login_page())
+    try:
+        client = get_google_client()
+        sheet = client.open("Cafe_Orders_DB").sheet1
+        records = sheet.get_all_records()
+        return HTMLResponse(dashboard_page(records))
+    except Exception as e:
+        log("error", "Admin dashboard failed", error=str(e))
+        return HTMLResponse(f"<p>Error loading dashboard: {e}</p>")
+
+@app.post("/admin/login")
+async def admin_login(request: Request):
+    form = await request.form()
+    password = form.get("password", "")
+    admin_key = os.environ.get("ADMIN_KEY", "")
+    if password != admin_key:
+        return HTMLResponse(login_page(error=True))
+    response = RedirectResponse(url="/admin", status_code=302)
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=make_token(admin_key),
+        httponly=True,
+        max_age=60 * 60 * 8  # 8 hours
+    )
+    return response
+
+@app.get("/admin/logout")
+async def admin_logout():
+    response = RedirectResponse(url="/admin", status_code=302)
+    response.delete_cookie(COOKIE_NAME)
+    return response
