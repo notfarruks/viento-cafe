@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .env
 reload_menu.py
+generate_qr.py

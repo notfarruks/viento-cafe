@@ -27,7 +27,6 @@ logging.basicConfig(
 logger = logging.getLogger("viento")
 
 def log(level: str, msg: str, **context):
-    """Structured log with key=value context appended."""
     ctx = " ".join(f"{k}={v}" for k, v in context.items())
     full_msg = f"{msg} | {ctx}" if ctx else msg
     getattr(logger, level)(full_msg)
@@ -37,7 +36,7 @@ app = FastAPI(title="Viento Cafe Pro - Premium Automated Waiter")
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
 executor = ThreadPoolExecutor(max_workers=4)
 
-# ─── Redis Session Store ───────────────────────────────────────────────────────
+# ─── Redis Session Store ──────────────────────────────────────────────────────
 redis_client = redis.from_url(
     os.environ.get("REDIS_URL", "redis://localhost:6379"),
     decode_responses=True
@@ -49,7 +48,7 @@ def get_session(phone: str) -> dict:
     if data:
         return json.loads(data)
     log("info", "New session created", phone=phone[-6:])
-    return {"lang": "az", "state": "IDLE", "basket": [], "table": "0 (Takeaway)"}
+    return {"lang": None, "state": "IDLE", "basket": [], "table": None}
 
 def save_session(phone: str, session: dict):
     redis_client.setex(f"session:{phone}", SESSION_TTL, json.dumps(session))
@@ -67,7 +66,7 @@ def is_rate_limited(phone: str) -> bool:
     pipe.execute()
     return False
 
-# ─── Twilio Signature Validation ──────────────────────────────────────────────
+# ─── Twilio Signature Validation ─────────────────────────────────────────────
 async def validate_twilio_request(request: Request) -> dict:
     auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
     validator = RequestValidator(auth_token)
@@ -159,6 +158,17 @@ def build_menu_text(lang: str, table: str) -> str:
         lines.append(f"{emoji} {display} - {price:.2f} AZN")
     return headers[lang] + "\n".join(lines) + footers[lang]
 
+# ─── Language Picker Message ──────────────────────────────────────────────────
+def build_language_picker(table: str) -> str:
+    return (
+        f"👋 *Viento Cafe*-a xoş gəlmisiniz! / Welcome! / Добро пожаловать!\n"
+        f"📍 *Masa / Table / Стол: {table}*\n\n"
+        f"Zəhmət olmasa dil seçin / Please select your language / Выберите язык:\n\n"
+        f"🇦🇿 *AZ* — Azərbaycan dili\n"
+        f"🇬🇧 *EN* — English\n"
+        f"🇷🇺 *RU* — Русский"
+    )
+
 @app.on_event("startup")
 async def startup_event():
     log("info", "Viento Cafe bot starting up...")
@@ -248,28 +258,48 @@ async def incoming_whatsapp(request: Request):
 
     log("info", "Incoming message", phone=From[-6:], state=session["state"], text=user_text[:20])
 
-    # 📍 TABLE ASSIGNMENT
+    # ─── STEP 1: TABLE ASSIGNMENT ─────────────────────────────────────────────
+    # Triggered by QR code scan which pre-fills "table5" etc.
     if "table" in user_text or "masa" in user_text or "стол" in user_text:
         table_digits = "".join([char for char in user_text if char.isdigit()])
         if table_digits:
             session["table"] = table_digits
-            log("info", "Table assigned", phone=From[-6:], table=table_digits)
-            msg = LEXICON[session["lang"]]["welcome"].format(table=session["table"])
-            response.message(msg)
+            session["state"] = "WAITING_FOR_LANG"
+            session["lang"] = None
+            log("info", "Table assigned, waiting for language", phone=From[-6:], table=table_digits)
+            response.message(build_language_picker(table_digits))
             save_session(From, session)
             return Response(content=str(response), media_type="application/xml")
 
-    # 🌍 LANGUAGE SWITCH
+    # ─── STEP 2: LANGUAGE SELECTION ───────────────────────────────────────────
+    if session["state"] == "WAITING_FOR_LANG" or session["lang"] is None:
+        if user_text in ["az", "en", "ru"]:
+            session["lang"] = user_text
+            session["state"] = "IDLE"
+            table = session["table"] or "?"
+            log("info", "Language selected", phone=From[-6:], lang=user_text, table=table)
+            response.message(LEXICON[user_text]["welcome"].format(table=table))
+            save_session(From, session)
+            return Response(content=str(response), media_type="application/xml")
+        else:
+            # Customer sent something else before picking a language
+            table = session["table"] or "?"
+            response.message(build_language_picker(table))
+            save_session(From, session)
+            return Response(content=str(response), media_type="application/xml")
+
+    # ─── FROM HERE: LANGUAGE AND TABLE ARE SET ────────────────────────────────
+    lang = session["lang"]
+    table = session["table"] or "Takeaway"
+
+    # 🌍 MID-SESSION LANGUAGE SWITCH
     if user_text in ["az", "ru", "en"]:
         session["lang"] = user_text
-        log("info", "Language switched", phone=From[-6:], lang=user_text)
-        msg = LEXICON[user_text]["welcome"].format(table=session["table"])
-        response.message(msg)
+        lang = user_text
+        log("info", "Language switched mid-session", phone=From[-6:], lang=user_text)
+        response.message(LEXICON[lang]["welcome"].format(table=table))
         save_session(From, session)
         return Response(content=str(response), media_type="application/xml")
-
-    lang = session["lang"]
-    table = session["table"]
 
     # 🚨 CALL WAITER
     if user_text in ["waiter", "ofisiant", "официант"]:
